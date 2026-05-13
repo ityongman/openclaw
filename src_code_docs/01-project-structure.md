@@ -73,18 +73,24 @@ openclaw/
 这是一个 **pnpm workspace monorepo**，多个包共享同一个 `node_modules`：
 
 ```yaml
-# pnpm-workspace.yaml
+# pnpm-workspace.yaml（实际内容）
 packages:
-  - "packages/*"
-  - "apps/*"
-  - "ui"
+  - .
+  - ui
+  - packages/*
+  - extensions/*
 ```
 
 类比：
 - Java：Maven 多模块项目
 - Go：Go workspace（`go.work`）
 
-**重要**：`extensions/` 里的插件不在 workspace 里，它们是在运行时动态加载的独立目录。
+**澄清两个常见误解**：
+
+- ✅ **`extensions/*` 在 workspace 里**——每个 extension 都是独立的 npm 包（有自己的 `package.json`），但通过 workspace 共享依赖与脚本。它们的"动态加载"指的是 Gateway 运行时按 manifest 注册，而不是脱离 workspace。
+- ❌ **`apps/*`（android/ios/macos）不在 workspace 里**——这些是原生客户端项目（Gradle / Xcode），构建工具完全独立。
+
+**包管理器版本**：仓库锁定在 `pnpm@10.33.0`（`package.json` 的 `packageManager` 字段），新装机器执行 `corepack enable` 后会自动用对的版本。
 
 ---
 
@@ -94,40 +100,58 @@ packages:
 
 | 工具 | 作用 | 类比 |
 |------|------|------|
-| **tsdown** | TypeScript 打包（基于 Rolldown） | Maven/Gradle 的 package 阶段 |
-| **TypeScript tsc** | 类型检查（不输出代码） | `javac` 的类型检查 |
+| **tsdown**（基于 Rolldown） | TypeScript 打包 | Maven/Gradle 的 package 阶段 |
+| **tsgo**（`@typescript/native-preview`） | 类型检查（仓库统一入口） | `javac` 的类型检查 |
 | **oxlint** | 代码 lint | Checkstyle / golangci-lint |
+| **oxfmt** | 代码格式化（**不是 Prettier**） | gofmt |
 | **vitest** | 单元/集成测试 | JUnit / Go testing |
-| **pnpm** | 包管理器 | Maven / Go modules |
+| **pnpm**（`10.33.0`） | 包管理器 + 任务运行器 | Maven / Go modules |
+
+⚠️ AGENTS.md 明确禁止：`tsc --noEmit`、`typecheck` 脚本、`check:types` 脚本、Prettier。一律走下面 3.2 的命令。
 
 ### 3.2 常用构建命令
 
 ```bash
-# 安装依赖
-pnpm install
+# === 基础 ===
+pnpm install                # 安装依赖
+pnpm dev                    # dev 模式
+pnpm openclaw <subcommand>  # 在仓库内跑 CLI（不需要全局安装）
+pnpm build                  # tsdown 构建到 dist/
 
-# 构建（编译 TypeScript → JavaScript 到 dist/）
-pnpm build
+# === 测试 ===
+pnpm test                   # 全部测试
+pnpm test:changed           # 仅变更涉及的测试（推送前默认）
+pnpm test:serial            # 串行（资源敏感场景）
+pnpm test:coverage          # 覆盖率
 
-# 运行测试
-pnpm test
+# === 类型检查（走 tsgo，不要用 tsc） ===
+pnpm tsgo:core              # 核心 src/ 类型检查
+pnpm tsgo:extensions        # 插件类型检查
+pnpm tsgo:all               # 全量
+pnpm check:test-types       # 测试代码类型
 
-# 类型检查（不构建）
-pnpm typecheck
+# === Lint / Format ===
+pnpm lint                   # oxlint
+pnpm format:check           # oxfmt 校验
+pnpm format                 # oxfmt 修复
 
-# Lint
-pnpm lint
+# === 门控 ===
+pnpm check:changed          # 智能变更门控（lint + 类型 + 测试）—— 推送前必跑
+pnpm check                  # 全量门控（落 main 前；最严格）
+pnpm check:import-cycles    # 检查导入循环
 ```
+
+> 推送前默认 `pnpm check:changed`；落 main 前 `pnpm check` + `pnpm test`。
 
 ### 3.3 源码 vs 输出
 
 ```
-src/entry.ts          →  dist/entry.js       （运行时用这个）
-src/cli/run-main.ts   →  dist/cli/run-main.js
-src/gateway/server.ts →  dist/gateway/server.js
+src/entry.ts                →  dist/entry.js          （运行时入口）
+src/cli/run-main.ts         →  dist/cli/run-main.js
+src/gateway/server.impl.ts  →  dist/gateway/server.impl.js
 ```
 
-开发时直接运行 TypeScript（通过 `tsx` 或 `jiti`），发布时用 `dist/`。
+开发时通过 `pnpm dev` / `pnpm openclaw` 直接执行（用 jiti/tsx 现编译现跑）；发布时用 `dist/`。
 
 ---
 
@@ -175,11 +199,47 @@ src/gateway/server.ts →  dist/gateway/server.js
     "openclaw": "openclaw.mjs"  // npm install -g 后的命令名
   },
   "exports": {
+    // 主入口（库模式）
     ".": "./dist/index.js",
-    "./plugin-sdk": "./dist/plugin-sdk/index.js"  // 子路径导出
+
+    // plugin-sdk 根入口
+    "./plugin-sdk": {
+      "types": "./dist/plugin-sdk/index.d.ts",   // TypeScript 类型声明
+      "default": "./dist/plugin-sdk/index.js"    // 实际 JS 文件
+    },
+
+    // plugin-sdk 子路径（共约 300 条，每条格式相同）
+    "./plugin-sdk/channel-core": {
+      "types": "./dist/plugin-sdk/channel-core.d.ts",
+      "default": "./dist/plugin-sdk/channel-core.js"
+    },
+    "./plugin-sdk/runtime": { ... },
+    "./plugin-sdk/memory-core": { ... },
+    // ... 更多子路径
+
+    // 其他顶级入口
+    "./extension-api": {
+      "types": "./dist/extension-api.d.ts",
+      "default": "./dist/extension-api.js"
+    },
+    "./cli-entry": {
+      "types": "./dist/cli-entry.d.ts",
+      "default": "./dist/cli-entry.js"
+    }
   }
 }
 ```
+
+**为什么 exports 有这么多条目（311 条）？**
+
+plugin-sdk 是插件开发的核心库，按功能粒度拆分成数百个子模块（`channel-core`、`memory-core`、`approval-runtime` 等），每个子模块独立导出，插件按需引入，避免打包进不需要的代码。
+
+每条 export 有两个字段：
+- `types`：TypeScript 类型声明文件（`.d.ts`），IDE 补全用
+- `default`：实际运行的 JavaScript 文件（`.js`）
+
+**对 Java 程序员**：类似 Maven 的多模块 jar，每个 `./plugin-sdk/xxx` 相当于一个独立的子模块 artifact。  
+**对 Python 程序员**：类似 `from openclaw.plugin_sdk import channel_core` 按需导入子包。
 
 ---
 

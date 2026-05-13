@@ -84,6 +84,21 @@ function assertPathIsNotSymlink(targetPath, label) {
   }
 }
 
+function renameSyncWithRetry(src, dest, retries = 5, delayMs = 1000) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      fs.renameSync(src, dest);
+      return;
+    } catch (error) {
+      if (attempt < retries && (error?.code === "EPERM" || error?.code === "EACCES")) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
 function replaceDirAtomically(targetPath, sourcePath) {
   assertPathIsNotSymlink(targetPath, "replace runtime deps");
   const targetParentDir = path.dirname(targetPath);
@@ -97,15 +112,15 @@ function replaceDirAtomically(targetPath, sourcePath) {
   let movedExistingTarget = false;
   try {
     if (fs.existsSync(targetPath)) {
-      fs.renameSync(targetPath, backupPath);
+      renameSyncWithRetry(targetPath, backupPath);
       writeRuntimeDepsTempOwner(backupPath);
       movedExistingTarget = true;
     }
-    fs.renameSync(sourcePath, targetPath);
+    renameSyncWithRetry(sourcePath, targetPath);
     removePathIfExists(backupPath);
   } catch (error) {
     if (movedExistingTarget && !fs.existsSync(targetPath) && fs.existsSync(backupPath)) {
-      fs.renameSync(backupPath, targetPath);
+      renameSyncWithRetry(backupPath, targetPath);
       removePathIfExists(path.join(targetPath, TEMP_OWNER_FILE));
     }
     throw error;

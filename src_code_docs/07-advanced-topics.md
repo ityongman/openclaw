@@ -433,4 +433,4 @@ pnpm typecheck
 
 ## 下一步
 
-读完所有基础文档后，参考 [08-reading-plan.md](./08-reading-plan.md) 的每日计划，系统性地阅读源码。
+读完所有基础文档后，参考 [09-reading-plan.md](./09-reading-plan.md) 的每日计划，系统性地阅读源码。

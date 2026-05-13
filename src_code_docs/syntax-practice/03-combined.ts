@@ -9,6 +9,7 @@ type OpenClawConfig = {
   host: string;
   secret: string;
   mode: "development" | "production";
+  timeout: number;
   ai: {
     model: string;
     temperature: number;
@@ -22,6 +23,7 @@ type RawConfig = Partial<{
   host: string | null;
   secret: string | null;
   mode: string | null;
+  timeout: number | null;
   ai: Partial<{
     model: string | null;
     temperature: number | null;
@@ -34,6 +36,7 @@ const DEFAULTS = {
   port: 3000,
   host: "localhost",
   mode: "development",
+  timeout: 5000,
   ai: {
     model: "gpt-4",
     temperature: 0.7,
@@ -61,6 +64,8 @@ function resolveConfig(
     // mode 需要验证合法性
     mode: (raw.mode === "production" ? "production" : DEFAULTS.mode),
 
+    timeout: raw.timeout ?? DEFAULTS.timeout,
+
     ai: {
       model: raw.ai?.model ?? DEFAULTS.ai.model,
       // temperature=0 是有效值（关闭随机性），必须用 ??
@@ -80,6 +85,7 @@ const full = resolveConfig(
     host: "example.com",
     secret: "file-secret",
     mode: "production",
+    timeout: 0,
     ai: { model: "gpt-3.5-turbo", temperature: 0, maxRetries: 0 },
   },
   undefined
@@ -115,3 +121,4 @@ try {
 //       在 DEFAULTS 里设置默认值 5000，
 //       在 resolveConfig 里用 ?? 合并，
 //       验证 timeout=0 能被正确保留（不被默认值覆盖）。
+// 任务已经完成

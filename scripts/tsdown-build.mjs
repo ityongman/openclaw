@@ -3,7 +3,7 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { BUNDLED_PLUGIN_PATH_PREFIX } from "./lib/bundled-plugin-paths.mjs";
 import { resolvePnpmRunner } from "./pnpm-runner.mjs";
 import {
@@ -195,6 +195,35 @@ export function createTsdownOutputScanner(params = {}) {
 
 export function resolveTsdownBuildInvocation(params = {}) {
   const env = params.env ?? process.env;
+  const platform = params.platform ?? process.platform;
+  const nodeExecPath = params.nodeExecPath ?? process.execPath;
+
+  // On Windows, pnpm-generated .cmd shims can be empty/broken, causing tsdown
+  // to run silently and produce no output. Invoke tsdown directly via node instead.
+  if (platform === "win32") {
+    const tsdownEntry = path.resolve(
+      fileURLToPath(new URL("..", import.meta.url)),
+      "node_modules/tsdown/dist/run.mjs",
+    );
+    return {
+      command: nodeExecPath,
+      args: [
+        tsdownEntry,
+        "--config-loader",
+        "unrun",
+        "--logLevel",
+        logLevel,
+        "--no-clean",
+        ...extraArgs,
+      ],
+      options: {
+        stdio: ["ignore", "pipe", "pipe"],
+        shell: false,
+        env,
+      },
+    };
+  }
+
   const runner = resolvePnpmRunner({
     pnpmArgs: [
       "exec",

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+console.error(">>> openclaw.mjs 被执行，Node.js 版本:", process.version);
 
 import { readFileSync } from "node:fs";
 import { access } from "node:fs/promises";

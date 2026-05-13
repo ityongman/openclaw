@@ -79,16 +79,16 @@ isTruthyEnvValue(value: string | undefined) → boolean
 
 ```bash
 # 在仓库根目录执行
-node --input-type=module << 'EOF'
+node -e "
 function isTruthyEnvValue(value) {
-  return value === "1" || value?.toLowerCase() === "true";
+  return value === '1' || value?.toLowerCase() === 'true';
 }
-console.log(isTruthyEnvValue("1"));       // true
-console.log(isTruthyEnvValue("true"));    // true
-console.log(isTruthyEnvValue("TRUE"));    // true
-console.log(isTruthyEnvValue("false"));   // false
-console.log(isTruthyEnvValue(undefined)); // false
-EOF
+console.log(isTruthyEnvValue('1'));
+console.log(isTruthyEnvValue('true'));
+console.log(isTruthyEnvValue('TRUE'));
+console.log(isTruthyEnvValue('false'));
+console.log(isTruthyEnvValue(undefined));
+"
 ```
 
 **预期输出**：
@@ -248,12 +248,80 @@ openclaw.mjs（可执行文件）
 
 #### 任务 3：阅读 `tsdown.config.ts` (30m)
 
-**阅读范围**：根目录 `tsdown.config.ts` 全文
+**阅读范围**：根目录 `tsdown.config.ts` 全文（约 330 行）
 
-**理解重点**：
-- `entry` 字段：指定打包入口文件（`src/entry.ts` → `dist/entry.js`）
-- `format: "esm"` — 输出 ES Module 格式
-- `outDir: "dist"` — 输出目录
+**注意**：这个文件远比想象中复杂，没有简单的 `entry`/`format`/`outDir` 字段，入口列表是动态构建的。阅读时抓住以下脉络：
+
+**第一步：从底部的 `export default` 开始读（L318-329）**
+
+```typescript
+// tsdown.config.ts L318-329（文件末尾的导出，是真正的入口点）
+export default defineConfig([
+  nodeBuildConfig({
+    clean: true,
+    entry: buildUnifiedDistEntries(),   // ← 核心：统一构建所有入口
+    deps: {
+      neverBundle: shouldNeverBundleDependency,  // ← 哪些包不打包进去
+    },
+  }),
+  ...buildBundledPluginConfigs(),  // ← 部分插件单独构建（需要 stage 运行时依赖）
+]);
+```
+
+**第二步：理解 `nodeBuildConfig()`（L84-92）**
+
+```typescript
+// tsdown.config.ts L84-92
+function nodeBuildConfig(config: UserConfig): UserConfig {
+  return {
+    ...config,
+    env: { NODE_ENV: "production" },  // 注入生产环境变量
+    fixedExtension: false,             // 输出 .js（不是 .mjs/.cjs）
+    platform: "node",                  // 目标平台是 Node.js
+    inputOptions: buildInputOptions,   // 自定义日志过滤（忽略 EVAL 警告等）
+  };
+}
+```
+
+**第三步：理解 `buildCoreDistEntries()`（L204-235）— 最重要**
+
+```typescript
+// tsdown.config.ts L204-235（节选，实际有 20+ 条）
+function buildCoreDistEntries(): Record<string, string> {
+  return {
+    index:  "src/index.ts",     // → dist/index.js  （库模式入口）
+    entry:  "src/entry.ts",     // → dist/entry.js  （CLI 主入口 ← 最重要）
+    "cli/daemon-cli": "src/cli/daemon-cli.ts",  // 显式独立入口
+    "infra/warning-filter": "src/infra/warning-filter.ts",
+    extensionAPI: "src/extensionAPI.ts",
+    // ... 共约 20 个显式入口
+  };
+}
+```
+
+**第四步：理解为什么这么复杂**
+
+| 原因 | 说明 |
+|------|------|
+| plugin-sdk 有 300+ 子路径导出 | 每个子路径单独打包，按需引入不打包全量 |
+| 插件和钩子单独入口 | `extensions/xxx/` 下每个插件有独立 dist 产物 |
+| 运行时边界文件 | `*.runtime.ts` 文件保持稳定文件名，确保 Gateway 热重载可用 |
+| 跨平台兼容 | `fixedExtension: false` 确保输出 `.js`（不是 `.mjs`） |
+
+**Debug 验证**：构建后查看 dist/ 的入口结构
+
+```bash
+# 构建后
+pnpm build
+
+# 查看生成的核心入口
+ls dist/entry.js dist/index.js dist/cli/daemon-cli.js
+# 预期：三个文件都存在
+
+# 查看 plugin-sdk 子路径
+ls dist/plugin-sdk/ | head -10
+# 预期：channel-core.js, runtime.js, setup.js 等 300+ 文件
+```
 
 ---
 
@@ -684,23 +752,181 @@ startGatewayFromCli(options?)
 
 ---
 
-#### 任务 3：浏览 `src/cli/daemon-cli.ts` (1h)
+#### 任务 3：浏览 `src/cli/daemon-cli.ts` 与守护进程架构 (1h)
 
-**阅读范围**：`src/cli/daemon-cli.ts` 全文
+**阅读范围**：`src/cli/daemon-cli.ts`（16 行薄壳）+ `src/cli/daemon-cli/lifecycle.ts`（前 60 行）+ `src/daemon/service.ts`（L171-215）
 
-**理解重点**：
-- `openclaw daemon start` 如何在后台启动进程
-- Linux/macOS 使用 systemd，Windows 使用什么机制？
+**第一步：`daemon-cli.ts` 是纯 re-export**
+
+```typescript
+// src/cli/daemon-cli.ts 全文（实际只有 16 行）
+export { registerDaemonCli } from "./daemon-cli/register.js";
+export { addGatewayServiceCommands } from "./daemon-cli/register-service-commands.js";
+export {
+  runDaemonInstall,
+  runDaemonRestart,
+  runDaemonStart,
+  runDaemonStatus,
+  runDaemonStop,
+  runDaemonUninstall,
+} from "./daemon-cli/runners.js";
+```
+
+真正的逻辑分散在 `src/cli/daemon-cli/` 目录下（约 30 个文件）。
+
+**第二步：理解跨平台服务管理（`src/daemon/service.ts` L171-215）**
+
+OpenClaw 用系统原生服务管理器在后台运行 Gateway：
+
+```typescript
+// src/daemon/service.ts L171-215
+type SupportedGatewayServicePlatform = "darwin" | "linux" | "win32";
+
+const GATEWAY_SERVICE_REGISTRY = {
+  darwin: {
+    label: "LaunchAgent",          // macOS：用 launchd（~/Library/LaunchAgents/）
+    install: installLaunchAgent,   // 写 .plist 文件
+    restart: restartLaunchAgent,   // launchctl kickstart
+    isLoaded: isLaunchAgentLoaded, // launchctl list
+  },
+  linux: {
+    label: "systemd",              // Linux：用 systemd（--user）
+    install: installSystemdService,// 写 .service 文件
+    restart: restartSystemdService,// systemctl --user restart
+    isLoaded: isSystemdServiceEnabled,
+  },
+  win32: {
+    label: "Scheduled Task",       // Windows：用任务计划程序
+    install: installScheduledTask, // schtasks /create
+    restart: restartScheduledTask, // schtasks /end + /run
+    isLoaded: isScheduledTaskInstalled,
+  },
+};
+
+export function resolveGatewayService(): GatewayService {
+  // 自动选择当前平台对应的实现
+  return GATEWAY_SERVICE_REGISTRY[process.platform as SupportedGatewayServicePlatform];
+}
+```
+
+**对 Java 程序员**：类似 Spring Boot 的 `ApplicationRunner`，`resolveGatewayService()` 相当于工厂方法，根据平台返回不同实现。  
+**对 Python 程序员**：类似 `if sys.platform == "darwin": ...`，但用 Registry 字典封装了多态。
+
+**第三步：`openclaw daemon start` 的执行路径**
+
+```
+openclaw daemon start
+    ↓
+src/cli/daemon-cli/lifecycle.ts: runDaemonStart()   (L152)
+    ↓
+src/daemon/service.ts: resolveGatewayService()
+    ↓
+macOS:   installLaunchAgent()  → launchctl load ~/Library/LaunchAgents/ai.openclaw.gateway.plist
+Linux:   installSystemdService() → systemctl --user enable openclaw-gateway.service
+Windows: installScheduledTask()  → schtasks /create /tn "OpenClaw Gateway"
+```
+
+**Debug 实操**：
+
+```bash
+# 查看当前平台会用哪种服务管理器
+node -e "console.log(process.platform)"
+# darwin → LaunchAgent
+# linux  → systemd
+# win32  → Scheduled Task
+
+# 查看 daemon 相关命令帮助
+node openclaw.mjs daemon --help
+```
 
 ---
 
 #### 任务 4：浏览 `src/cli/plugins-cli.ts` (1h)
 
-**阅读范围**：`src/cli/plugins-cli.ts` 全文
+**阅读范围**：`src/cli/plugins-cli.ts` L1-60（类型定义）+ L132-200（`registerPluginsCli` 函数体）
 
-**理解重点**：
-- `openclaw plugins install discord` 如何下载和安装插件
-- 安装后配置文件如何更新
+**第一步：文件结构总览**
+
+```
+src/cli/plugins-cli.ts（约 600 行）
+  L17-54    类型定义（PluginsListOptions、PluginUninstallOptions 等）
+  L57-130   内部工具函数（格式化输出用）
+  L132      registerPluginsCli(program: Command) ← 主入口，注册所有 plugins 子命令
+    ├── plugins list
+    ├── plugins inspect <id>
+    ├── plugins install <source>
+    ├── plugins uninstall <id>
+    ├── plugins update [id]
+    └── plugins marketplace list
+```
+
+**第二步：找 `registerPluginsCli` 函数（L132）**
+
+```typescript
+// src/cli/plugins-cli.ts L132
+export function registerPluginsCli(program: Command) {
+  const plugins = program
+    .command("plugins")
+    .description("Manage OpenClaw plugins and extensions");
+
+  // "plugins list" 子命令
+  plugins
+    .command("list")
+    .option("--json", "Print JSON")
+    .option("--enabled", "Only show enabled plugins")
+    .action(async (opts: PluginsListOptions) => {
+      const { buildPluginRegistrySnapshotReport } = await import("../plugins/status.js");
+      // 注意：懒加载，只有执行 list 时才加载 status.js
+      const cfg = loadConfig();
+      const report = buildPluginRegistrySnapshotReport({ config: cfg, ... });
+      // ...格式化并打印表格
+    });
+  // ...其他子命令
+}
+```
+
+**第三步：理解插件安装（install）的实际执行路径**
+
+```typescript
+// plugins install 命令的 action（找 "install" 关键字）
+plugins
+  .command("install <source>")    // source = npm包名 / 本地路径 / GitHub URL
+  .action(async (source, opts) => {
+    const { installPlugin } = await import("../plugins/install.js");  // 懒加载
+    await installPlugin(source, {
+      config,
+      stateDir: resolveStateDir(),
+    });
+    // 安装后：更新 ~/.openclaw/openclaw.json 的 plugins.allow 列表
+  });
+```
+
+**安装流程完整链路**：
+
+```
+openclaw plugins install discord
+    ↓
+src/cli/plugins-cli.ts: action("install")
+    ↓
+src/plugins/install.ts: installPlugin(source)
+    ├── 判断 source 类型（npm/本地/GitHub）
+    ├── npm install 或 copy 到插件目录
+    ├── 读取 openclaw.plugin.json 验证合法性
+    └── 更新 config.plugins.allow: [..., "discord"]
+```
+
+**Debug 实操**：
+
+```bash
+# 查看当前已安装的插件
+node openclaw.mjs plugins list
+
+# 查看某个插件的详细信息
+node openclaw.mjs plugins inspect discord --json 2>&1 | python3 -m json.tool
+
+# grep 找 install 命令的 action 在文件哪行
+grep -n '"install"\|installPlugin' src/cli/plugins-cli.ts | head -10
+```
 
 ---
 
@@ -1170,9 +1396,134 @@ node openclaw.mjs start 2>&1 | head -20
 
 ---
 
-#### 任务 3：阅读 `src/config/types.agents.ts` + `src/config/types.providers.ts` (1h)
+#### 任务 3：精读 `src/config/types.agents.ts` + `src/config/types.models.ts` (1h)
 
-理解 Agent 和 Provider 配置的完整类型定义。
+理解 Agent 和模型提供商的配置类型定义。这两个文件定义了配置文件中最复杂的两个部分。
+
+> **注意**：`types.providers.ts` 不存在。提供商相关类型在 `types.models.ts` 里。
+
+---
+
+**第一步：`types.agents.ts` — Agent 配置类型**
+
+打开 `src/config/types.agents.ts`，直接跳到 **L76** 的 `AgentConfig` 类型。
+
+这是单个 Agent 的完整配置结构。逐字段阅读并理解用途：
+
+| 字段 | 类型 | 含义 |
+|------|------|------|
+| `id` | `string` | Agent 唯一标识符，对应 Session Key 中的 `agentId` 段 |
+| `default?` | `boolean` | 是否为默认 Agent（收到消息时没有明确指定 Agent 时使用） |
+| `model?` | `AgentModelConfig` | 覆盖该 Agent 使用的模型（如 `claude-3-5-sonnet`） |
+| `systemPromptOverride?` | `string` | 完全替换系统提示词（不合并，直接覆盖全局配置） |
+| `agentDir?` | `string` | Agent 的工作目录（文件操作的相对基准路径） |
+| `workspace?` | `string` | 工作区路径（更宽泛的文件访问范围） |
+| `thinkingDefault?` | `"off" \| "minimal" \| ... \| "max"` | 默认思考深度（Claude 的 thinking 功能） |
+| `verboseDefault?` | `"off" \| "on" \| "full"` | 日志详细程度 |
+| `fastModeDefault?` | `boolean` | 是否默认启用快速模式（牺牲质量换速度） |
+| `skills?` | `string[]` | 该 Agent 可调用的技能白名单 |
+| `memorySearch?` | `MemorySearchConfig` | 长期记忆检索配置（向量搜索） |
+| `humanDelay?` | `HumanDelayConfig` | 模拟人类打字延迟（避免消息风暴） |
+| `tools?` | `AgentToolsConfig` | 工具调用配置（MCP 工具、内置工具的开关） |
+| `sandbox?` | `AgentSandboxConfig` | 代码执行沙箱配置 |
+| `params?` | `Record<string, unknown>` | 透传给 AI 提供商的原始参数（temperature 等） |
+| `subagents?` | `{ allowAgents?, model?, ... }` | 子 Agent 生成策略（允许哪些 Agent 被动态创建） |
+| `runtime?` | `AgentRuntimeConfig` | Agent 运行时策略（嵌入式 vs. 子进程模式） |
+
+**Java 类比**：`AgentConfig` 相当于 Spring Boot 里一个 `@Bean` 的完整配置属性类（`@ConfigurationProperties`），每个字段对应 `application.yaml` 中的一个配置项。
+
+**向上看 L135**：`AgentsConfig` 类型（复数）= `{ defaults?, list? }` — `list` 里放多个 `AgentConfig`，`defaults` 里放全局默认值，单个 Agent 的设置会覆盖 `defaults`。
+
+---
+
+**第二步：`types.models.ts` — 模型提供商类型**
+
+打开 `src/config/types.models.ts`。这里定义了如何在配置文件中声明 AI 模型和提供商。
+
+**L9 `MODEL_APIS`**（`as const` 数组）：枚举所有支持的 API 协议：
+
+```typescript
+export const MODEL_APIS = [
+  "openai-completions",    // ← OpenAI 标准聊天接口
+  "openai-responses",      // ← OpenAI Responses API（较新）
+  "anthropic-messages",    // ← Anthropic 原生接口
+  "google-generative-ai",  // ← Google Gemini
+  "ollama",                // ← 本地 Ollama
+  // ... 共 9 种
+] as const;
+```
+
+**L117 `ModelProviderConfig`**：一个提供商（endpoint）的配置：
+```typescript
+{
+  baseUrl: string;            // ← 提供商 API 地址，如 "https://api.anthropic.com"
+  apiKey?: SecretInput;       // ← API Key（支持 ${ENV_VAR} 形式）
+  api?: ModelApi;             // ← 使用哪种协议（见 MODEL_APIS）
+  timeoutSeconds?: number;    // ← 请求超时
+  models: ModelDefinitionConfig[];  // ← 该提供商下的模型列表
+}
+```
+
+**L77 `ModelDefinitionConfig`**：单个模型的定义：
+```typescript
+{
+  id: string;          // ← 模型 ID，如 "claude-3-5-sonnet-20241022"
+  contextWindow: number; // ← 上下文窗口大小（token 数）
+  maxTokens: number;   // ← 单次最大输出 token
+  reasoning: boolean;  // ← 是否支持 thinking/reasoning 功能
+  cost: { input, output, cacheRead, cacheWrite }; // ← 每百万 token 价格
+  compat?: ModelCompatConfig; // ← API 兼容性标志
+}
+```
+
+**L146 `ModelsConfig`**（最终暴露给 `OpenClawConfig` 的顶层字段）：
+```typescript
+{
+  mode?: "merge" | "replace"; // ← "merge" 在内置模型基础上叠加，"replace" 完全替换
+  providers?: Record<string, ModelProviderConfig>; // ← key 是自定义名称
+}
+```
+
+**Python 类比**：`providers` 字典相当于 `dict[str, ProviderConfig]`，key 是你给这个 endpoint 起的名字，value 是连接参数 + 模型列表。
+
+---
+
+**实际配置文件对照练习**
+
+在 `~/.openclaw/openclaw.json`（或 `test-fixtures/` 下的示例）里找到 `agents` 和 `models` 字段，对照刚才读的类型定义，逐字段确认：
+
+```json
+{
+  "agents": {
+    "list": [
+      {
+        "id": "main",
+        "model": { "primary": "claude-3-5-sonnet" },
+        "thinkingDefault": "low"
+      }
+    ]
+  },
+  "models": {
+    "providers": {
+      "my-anthropic": {
+        "baseUrl": "https://api.anthropic.com",
+        "apiKey": "${ANTHROPIC_API_KEY}",
+        "api": "anthropic-messages",
+        "models": [...]
+      }
+    }
+  }
+}
+```
+
+---
+
+**验证问题**
+
+1. `AgentConfig.systemPromptOverride` 和 `AgentConfig.agentDir` 分别控制什么？
+2. `AgentsConfig` 里 `defaults` 和 `list` 的关系是什么？（单个 Agent 的字段会覆盖 `defaults` 吗？）
+3. `ModelProviderConfig.api` 字段和 `MODEL_APIS` 常量数组是什么关系？
+4. 如果 `ModelsConfig.mode` 设为 `"replace"`，内置模型（如 gpt-4o）还能用吗？
 
 ---
 
